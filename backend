@@ -1,0 +1,277 @@
+import psycopg2
+import pandas as pd
+from datetime import datetime
+
+# --- DATABASE CONNECTION ---
+# IMPORTANT: Replace these placeholders with your actual PostgreSQL credentials.
+DB_NAME = "manager track"
+DB_USER = "postgres"
+DB_PASS = "2121"
+DB_HOST = "your_db_host"
+DB_PORT = "your_db_port"
+
+def connect_to_db():
+    """Establishes a connection to the PostgreSQL database."""
+    try:
+        conn = psycopg2.connect(
+            dbname=DB_NAME,
+            user=DB_USER,
+            password=DB_PASS,
+            host=DB_HOST,
+            port=DB_PORT
+        )
+        return conn
+    except psycopg2.OperationalError as e:
+        # This error is caught by the frontend to display a user-friendly message.
+        raise e
+
+# --- TABLE CREATION ---
+def create_tables():
+    """Creates all necessary tables in the database if they don't already exist."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    commands = (
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            user_id SERIAL PRIMARY KEY,
+            username VARCHAR(255) UNIQUE NOT NULL,
+            password VARCHAR(255) NOT NULL,
+            role VARCHAR(50) NOT NULL CHECK (role IN ('Manager', 'Employee')),
+            manager_id INTEGER REFERENCES users(user_id)
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS goals (
+            goal_id SERIAL PRIMARY KEY,
+            employee_id INTEGER NOT NULL REFERENCES users(user_id),
+            manager_id INTEGER NOT NULL REFERENCES users(user_id),
+            goal_description TEXT NOT NULL,
+            due_date DATE NOT NULL,
+            status VARCHAR(50) NOT NULL CHECK (status IN ('Draft', 'In Progress', 'Completed', 'Cancelled')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            completed_at TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS tasks (
+            task_id SERIAL PRIMARY KEY,
+            goal_id INTEGER NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE,
+            task_description TEXT NOT NULL,
+            task_status VARCHAR(50) NOT NULL CHECK (task_status IN ('Pending Approval', 'Approved', 'Completed')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """,
+        """
+        CREATE TABLE IF NOT EXISTS feedback (
+            feedback_id SERIAL PRIMARY KEY,
+            goal_id INTEGER NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE,
+            manager_id INTEGER NOT NULL REFERENCES users(user_id),
+            employee_id INTEGER NOT NULL REFERENCES users(user_id),
+            feedback_text TEXT NOT NULL,
+            feedback_type VARCHAR(50) NOT NULL CHECK (feedback_type IN ('Manual', 'Automated')),
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    for command in commands:
+        cur.execute(command)
+    
+    # --- ADD SAMPLE DATA (if users table is empty) ---
+    cur.execute("SELECT COUNT(*) FROM users")
+    if cur.fetchone()[0] == 0:
+        # Add a manager
+        cur.execute("INSERT INTO users (username, password, role) VALUES (%s, %s, %s) RETURNING user_id", ('manager1', 'pass', 'Manager'))
+        manager_id = cur.fetchone()[0]
+        # Add employees for the manager
+        cur.execute("INSERT INTO users (username, password, role, manager_id) VALUES (%s, %s, %s, %s)", ('employee1', 'pass', 'Employee', manager_id))
+        cur.execute("INSERT INTO users (username, password, role, manager_id) VALUES (%s, %s, %s, %s)", ('employee2', 'pass', 'Employee', manager_id))
+
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# --- CRUD OPERATIONS ---
+
+# C.R.U.D. for Users
+def verify_user(username, password):
+    """Verifies user credentials and returns user info."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username, role, manager_id FROM users WHERE username = %s AND password = %s", (username, password))
+    user = cur.fetchone()
+    cur.close()
+    conn.close()
+    if user:
+        return {'user_id': user[0], 'username': user[1], 'role': user[2], 'manager_id': user[3]}
+    return None
+
+def get_employees_by_manager(manager_id):
+    """READ: Fetches all employees reporting to a specific manager."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute("SELECT user_id, username FROM users WHERE manager_id = %s AND role = 'Employee'", (manager_id,))
+    employees = cur.fetchall()
+    cur.close()
+    conn.close()
+    return employees
+
+# C.R.U.D. for Goals
+def add_goal(employee_id, manager_id, description, due_date):
+    """CREATE: Adds a new goal to the database."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO goals (employee_id, manager_id, goal_description, due_date, status) VALUES (%s, %s, %s, %s, %s)",
+        (employee_id, manager_id, description, due_date, 'Draft')
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_goals(user_id, role):
+    """READ: Fetches goals for a given employee or all employees under a manager."""
+    conn = connect_to_db()
+    query = """
+        SELECT g.goal_id, u.username as employee_name, g.goal_description, g.due_date, g.status
+        FROM goals g
+        JOIN users u ON g.employee_id = u.user_id
+    """
+    if role == 'Employee':
+        query += " WHERE g.employee_id = %s"
+        params = (user_id,)
+    else: # Manager
+        query += " WHERE g.manager_id = %s"
+        params = (user_id,)
+    
+    df = pd.read_sql(query, conn, params=params)
+    conn.close()
+    return df
+
+def update_goal_status(goal_id, status):
+    """UPDATE: Updates the status of a specific goal."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    
+    completed_at_val = datetime.now() if status == 'Completed' else None
+    
+    cur.execute(
+        "UPDATE goals SET status = %s, completed_at = %s WHERE goal_id = %s",
+        (status, completed_at_val, goal_id)
+    )
+    conn.commit()
+
+    # Automated Feedback Trigger
+    if status == 'Completed':
+        cur.execute("SELECT employee_id, manager_id, goal_description FROM goals WHERE goal_id = %s", (goal_id,))
+        goal_info = cur.fetchone()
+        if goal_info:
+            employee_id, manager_id, desc = goal_info
+            feedback_text = f"Automated Feedback: Great work completing the goal - '{desc}'!"
+            add_feedback(goal_id, manager_id, employee_id, feedback_text, 'Automated')
+
+    cur.close()
+    conn.close()
+
+# C.R.U.D. for Tasks
+def add_task(goal_id, description):
+    """CREATE: Adds a new task for a goal."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO tasks (goal_id, task_description, task_status) VALUES (%s, %s, %s)",
+        (goal_id, description, 'Pending Approval')
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_tasks_for_goal(goal_id):
+    """READ: Fetches all tasks for a specific goal."""
+    conn = connect_to_db()
+    df = pd.read_sql("SELECT task_id, task_description, task_status FROM tasks WHERE goal_id = %s", conn, params=(goal_id,))
+    conn.close()
+    return df
+
+def update_task_status(task_id, status):
+    """UPDATE: Updates the status of a specific task."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute("UPDATE tasks SET task_status = %s WHERE task_id = %s", (status, task_id))
+    conn.commit()
+    cur.close()
+    conn.close()
+
+# C.R.U.D. for Feedback
+def add_feedback(goal_id, manager_id, employee_id, feedback_text, feedback_type='Manual'):
+    """CREATE: Adds new feedback for a goal."""
+    conn = connect_to_db()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO feedback (goal_id, manager_id, employee_id, feedback_text, feedback_type) VALUES (%s, %s, %s, %s, %s)",
+        (goal_id, manager_id, employee_id, feedback_text, feedback_type)
+    )
+    conn.commit()
+    cur.close()
+    conn.close()
+
+def get_feedback_for_goal(goal_id):
+    """READ: Fetches all feedback for a specific goal."""
+    conn = connect_to_db()
+    df = pd.read_sql("SELECT feedback_text, feedback_type, created_at FROM feedback WHERE goal_id = %s", conn, params=(goal_id,))
+    conn.close()
+    return df
+
+# --- REPORTING & INSIGHTS ---
+def get_performance_history(employee_id):
+    """Fetches a complete performance history for an employee."""
+    conn = connect_to_db()
+    query = """
+        SELECT g.goal_description, g.status as goal_status, g.due_date, f.feedback_text, f.created_at as feedback_date
+        FROM goals g
+        LEFT JOIN feedback f ON g.goal_id = f.goal_id
+        WHERE g.employee_id = %s
+        ORDER BY g.due_date DESC
+    """
+    df = pd.read_sql(query, conn, params=(employee_id,))
+    conn.close()
+    return df
+
+def get_business_insights(manager_id):
+    """Generates various business insights for a manager's team."""
+    conn = connect_to_db()
+    insights = {}
+
+    # COUNT: Goal status distribution
+    status_query = "SELECT status, COUNT(*) as count FROM goals WHERE manager_id = %s GROUP BY status"
+    insights['status_distribution'] = pd.read_sql(status_query, conn, params=(manager_id,))
+
+    # SUM/COUNT: Total goals per employee
+    goals_per_employee_query = """
+        SELECT u.username, COUNT(g.goal_id) as total_goals
+        FROM users u
+        LEFT JOIN goals g ON u.user_id = g.employee_id
+        WHERE u.manager_id = %s
+        GROUP BY u.username
+    """
+    insights['goals_per_employee'] = pd.read_sql(goals_per_employee_query, conn, params=(manager_id,))
+
+    # AVG: Average time to complete goals (in days)
+    avg_time_query = """
+        SELECT AVG(EXTRACT(DAY FROM completed_at - created_at)) as avg_completion_days
+        FROM goals
+        WHERE manager_id = %s AND status = 'Completed' AND completed_at IS NOT NULL
+    """
+    df_avg = pd.read_sql(avg_time_query, conn, params=(manager_id,))
+    insights['avg_completion_days'] = df_avg['avg_completion_days'].iloc[0] if not df_avg.empty else 0
+    
+    # MIN/MAX: Not directly applicable without more complex metrics, but we can show earliest/latest due dates.
+    min_max_date_query = """
+        SELECT MIN(due_date) as earliest_due, MAX(due_date) as latest_due
+        FROM goals WHERE manager_id = %s
+    """
+    df_dates = pd.read_sql(min_max_date_query, conn, params=(manager_id,))
+    insights['earliest_due'] = df_dates['earliest_due'].iloc[0]
+    insights['latest_due'] = df_dates['latest_due'].iloc[0]
+
+    conn.close()
+    return insights
