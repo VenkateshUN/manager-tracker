@@ -1,0 +1,53 @@
+-- Schema for the Performance Management System
+
+-- Users Table
+-- Stores login information, roles, and the manager-employee hierarchy.
+CREATE TABLE IF NOT EXISTS users (
+    user_id SERIAL PRIMARY KEY,
+    username VARCHAR(255) UNIQUE NOT NULL,
+    password VARCHAR(255) NOT NULL,
+    role VARCHAR(50) NOT NULL CHECK (role IN ('Manager', 'Employee')),
+    manager_id INTEGER REFERENCES users(user_id) -- Self-referencing key for manager
+);
+
+-- Goals Table
+-- Stores performance goals set by managers for employees.
+CREATE TABLE IF NOT EXISTS goals (
+    goal_id SERIAL PRIMARY KEY,
+    employee_id INTEGER NOT NULL REFERENCES users(user_id),
+    manager_id INTEGER NOT NULL REFERENCES users(user_id),
+    goal_description TEXT NOT NULL,
+    due_date DATE NOT NULL,
+    status VARCHAR(50) NOT NULL CHECK (status IN ('Draft', 'In Progress', 'Completed', 'Cancelled')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP -- Populated when status becomes 'Completed'
+);
+
+-- Tasks Table
+-- Stores tasks logged by employees to achieve their goals.
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id SERIAL PRIMARY KEY,
+    goal_id INTEGER NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE,
+    task_description TEXT NOT NULL,
+    task_status VARCHAR(50) NOT NULL CHECK (task_status IN ('Pending Approval', 'Approved', 'Completed')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Feedback Table
+-- Stores feedback provided by managers on specific goals.
+CREATE TABLE IF NOT EXISTS feedback (
+    feedback_id SERIAL PRIMARY KEY,
+    goal_id INTEGER NOT NULL REFERENCES goals(goal_id) ON DELETE CASCADE,
+    manager_id INTEGER NOT NULL REFERENCES users(user_id),
+    employee_id INTEGER NOT NULL REFERENCES users(user_id),
+    feedback_text TEXT NOT NULL,
+    feedback_type VARCHAR(50) NOT NULL CHECK (feedback_type IN ('Manual', 'Automated')),
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Optional: Add indexes for performance improvement on frequently queried columns
+CREATE INDEX IF NOT EXISTS idx_goals_employee_id ON goals(employee_id);
+CREATE INDEX IF NOT EXISTS idx_goals_manager_id ON goals(manager_id);
+CREATE INDEX IF NOT EXISTS idx_tasks_goal_id ON tasks(goal_id);
+CREATE INDEX IF NOT EXISTS idx_feedback_goal_id ON feedback(goal_id);
+\
