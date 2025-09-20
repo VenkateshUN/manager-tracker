@@ -1,0 +1,220 @@
+# manager-trackerimport streamlit as st
+import pandas as pd
+from datetime import date
+import Backend as be
+import plotly.express as px
+
+# --- PAGE CONFIGURATION ---
+st.set_page_config(page_title="Performance Management System", layout="wide")
+
+# --- LOGIN/LOGOUT LOGIC ---
+def login_page():
+    st.header("Login")
+    with st.form("login_form"):
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Login")
+        if submitted:
+            user = be.verify_user(username, password)
+            if user:
+                st.session_state['logged_in'] = True
+                st.session_state['user_info'] = user
+                st.rerun()
+            else:
+                st.error("Invalid username or password")
+
+def logout():
+    st.session_state['logged_in'] = False
+    st.session_state.pop('user_info', None)
+    st.rerun()
+
+# --- MANAGER VIEW ---
+def manager_dashboard():
+    st.title(f"Manager Dashboard: Welcome, {st.session_state['user_info']['username']}")
+    st.sidebar.button("Logout", on_click=logout)
+
+    menu = ["Goal Setting", "Progress Tracking", "Reporting", "Business Insights"]
+    choice = st.sidebar.selectbox("Menu", menu)
+    
+    manager_id = st.session_state['user_info']['user_id']
+    employees = be.get_employees_by_manager(manager_id)
+    employee_dict = {name: uid for uid, name in employees}
+
+    if not employees:
+        st.warning("You do not have any employees assigned to you.")
+        return
+
+    if choice == "Goal Setting":
+        st.subheader("Set a New Goal")
+        with st.form("set_goal_form", clear_on_submit=True):
+            selected_employee_name = st.selectbox("Select Employee", options=employee_dict.keys())
+            goal_desc = st.text_area("Goal Description")
+            due_date = st.date_input("Due Date", min_value=date.today())
+            
+            submitted = st.form_submit_button("Set Goal")
+            if submitted:
+                employee_id = employee_dict[selected_employee_name]
+                be.add_goal(employee_id, manager_id, goal_desc, due_date)
+                st.success(f"Goal set for {selected_employee_name}")
+    
+    elif choice == "Progress Tracking":
+        st.subheader("Track Team Progress")
+        goals_df = be.get_goals(manager_id, 'Manager')
+        if goals_df.empty:
+            st.info("No goals have been set for your team yet.")
+            return
+
+        st.dataframe(goals_df, use_container_width=True)
+        
+        selected_goal_id = st.selectbox("Select a Goal to Manage", options=goals_df['goal_id'].unique())
+        
+        if selected_goal_id:
+            goal_details = goals_df[goals_df['goal_id'] == selected_goal_id].iloc[0]
+            st.write(f"**Description:** {goal_details['goal_description']}")
+            
+            # Update Goal Status
+            st.write("---")
+            st.markdown("#### Update Goal Status")
+            new_status = st.selectbox("New Status", ['Draft', 'In Progress', 'Completed', 'Cancelled'], index=['Draft', 'In Progress', 'Completed', 'Cancelled'].index(goal_details['status']))
+            if st.button("Update Goal Status"):
+                be.update_goal_status(selected_goal_id, new_status)
+                st.success("Goal status updated!")
+                st.rerun()
+            
+            # View & Approve Tasks
+            st.write("---")
+            st.markdown("#### Manage Tasks")
+            tasks_df = be.get_tasks_for_goal(selected_goal_id)
+            if not tasks_df.empty:
+                for index, row in tasks_df.iterrows():
+                    col1, col2, col3 = st.columns([3, 2, 2])
+                    with col1:
+                        st.write(row['task_description'])
+                    with col2:
+                        st.write(f"Status: {row['task_status']}")
+                    with col3:
+                        if row['task_status'] == 'Pending Approval':
+                            if st.button("Approve Task", key=f"approve_{row['task_id']}"):
+                                be.update_task_status(row['task_id'], 'Approved')
+                                st.rerun()
+            else:
+                st.info("No tasks logged for this goal yet.")
+
+            # Provide Feedback
+            st.write("---")
+            st.markdown("#### Provide Feedback")
+            with st.form(f"feedback_form_{selected_goal_id}", clear_on_submit=True):
+                feedback_text = st.text_area("Enter your feedback")
+                submit_feedback = st.form_submit_button("Submit Feedback")
+                if submit_feedback:
+                    employee_id = be.get_goals(manager_id, 'Manager').loc[be.get_goals(manager_id, 'Manager')['goal_id'] == selected_goal_id, 'employee_name'].map(employee_dict).iloc[0]
+                    be.add_feedback(selected_goal_id, manager_id, employee_id, feedback_text)
+                    st.success("Feedback submitted successfully.")
+            
+            # View Existing Feedback
+            feedback_history = be.get_feedback_for_goal(selected_goal_id)
+            if not feedback_history.empty:
+                st.write("**Feedback History:**")
+                st.dataframe(feedback_history, use_container_width=True)
+
+    elif choice == "Reporting":
+        st.subheader("Employee Performance History")
+        selected_employee_name = st.selectbox("Select Employee to View Report", options=employee_dict.keys())
+        if selected_employee_name:
+            employee_id = employee_dict[selected_employee_name]
+            history_df = be.get_performance_history(employee_id)
+            if history_df.empty:
+                st.info(f"No performance history found for {selected_employee_name}.")
+            else:
+                st.dataframe(history_df, use_container_width=True)
+
+    elif choice == "Business Insights":
+        st.subheader("Team Performance Insights")
+        insights = be.get_business_insights(manager_id)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("Avg. Goal Completion Time (Days)", f"{insights.get('avg_completion_days', 0):.2f}")
+        with col2:
+            st.metric("Latest Goal Due Date", f"{insights.get('latest_due', 'N/A')}")
+        
+        st.write("---")
+        
+        fig1 = px.pie(insights['status_distribution'], names='status', values='count', title='Goal Status Distribution')
+        st.plotly_chart(fig1, use_container_width=True)
+
+        fig2 = px.bar(insights['goals_per_employee'], x='username', y='total_goals', title='Total Goals Per Employee')
+        st.plotly_chart(fig2, use_container_width=True)
+
+# --- EMPLOYEE VIEW ---
+def employee_dashboard():
+    st.title(f"Employee Dashboard: Welcome, {st.session_state['user_info']['username']}")
+    st.sidebar.button("Logout", on_click=logout)
+    
+    user_id = st.session_state['user_info']['user_id']
+    goals_df = be.get_goals(user_id, 'Employee')
+
+    if goals_df.empty:
+        st.info("You have no goals assigned yet. Please contact your manager.")
+        return
+        
+    st.subheader("My Goals")
+    st.dataframe(goals_df, use_container_width=True)
+    
+    selected_goal_id = st.selectbox("Select a Goal to View Details/Log Tasks", options=goals_df['goal_id'].unique())
+    
+    if selected_goal_id:
+        st.subheader("Goal Details")
+        
+        # Log a new task
+        with st.form(f"task_form_{selected_goal_id}", clear_on_submit=True):
+            task_desc = st.text_area("Describe a new task to achieve this goal")
+            submit_task = st.form_submit_button("Log Task for Approval")
+            if submit_task and task_desc:
+                be.add_task(selected_goal_id, task_desc)
+                st.success("Task submitted to your manager for approval.")
+        
+        # View existing tasks
+        st.write("---")
+        st.markdown("#### My Tasks for this Goal")
+        tasks_df = be.get_tasks_for_goal(selected_goal_id)
+        if not tasks_df.empty:
+            st.dataframe(tasks_df, use_container_width=True)
+        else:
+            st.info("No tasks logged for this goal yet.")
+
+        # View feedback
+        st.write("---")
+        st.markdown("#### Feedback from Manager")
+        feedback_df = be.get_feedback_for_goal(selected_goal_id)
+        if not feedback_df.empty:
+            st.dataframe(feedback_df, use_container_width=True)
+        else:
+            st.info("No feedback received for this goal yet.")
+
+
+# --- MAIN APP LOGIC ---
+def main():
+    try:
+        # One-time setup
+        if 'db_initialized' not in st.session_state:
+            be.create_tables()
+            st.session_state['db_initialized'] = True
+
+        if 'logged_in' not in st.session_state:
+            st.session_state['logged_in'] = False
+
+        if not st.session_state['logged_in']:
+            login_page()
+        else:
+            user_role = st.session_state['user_info']['role']
+            if user_role == 'Manager':
+                manager_dashboard()
+            else:
+                employee_dashboard()
+    except Exception as e:
+        st.error("Database connection failed. Please check the backend configuration and ensure the database server is running.")
+        st.error(f"Details: {e}")
+
+if __name__ == "__main__":
+    main()
